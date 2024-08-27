@@ -7,44 +7,31 @@ pipeline {
         AMI_NAME_PREFIX = 'test'
     }
     stages {
-        stage('Terminate an Instance and Wait for New Instance') {
+        stage('Get Instance ID') {
             steps {
                 script {
-                    echo "Fetching current instance IDs in the ASG..."
-                    def instanceIds = sh(script: "aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${ASG_NAME} --region ${REGION} --query 'AutoScalingGroups[0].Instances[*].InstanceId' --output text", returnStdout: true).trim().split()
-                    def instanceIdToTerminate = instanceIds[0]
-                    echo "Terminating instance: ${instanceIdToTerminate} to trigger a new instance launch..."
-
-                    sh "aws autoscaling terminate-instance-in-auto-scaling-group --instance-id ${instanceIdToTerminate} --region ${REGION} --no-should-decrement-desired-capacity"
+                    echo "Fetching the current instance ID from the Auto Scaling Group..."
+                    def instanceId = sh(script: "aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${ASG_NAME} --region ${REGION} --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text", returnStdout: true).trim()
                     
-                    echo "Waiting for a new instance to launch..."
-                    def newInstanceId = ""
-                    retry(5) {
-                        sleep(60) // Wait 60 seconds between retries
-                        newInstanceId = sh(script: """
-                            aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${ASG_NAME} --region ${REGION} --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' --output text | grep -v ${instanceIdToTerminate}
-                        """, returnStdout: true).trim()
-                        if (newInstanceId == "") {
-                            error "New instance not found yet, retrying..."
-                        }
-                    }
-
-                    echo "New Instance ID: ${newInstanceId}"
-                    sleep(300) // Wait for the instance to be fully initialized
-                    env.NEW_INSTANCE_ID = newInstanceId
+                    echo "Current Instance ID: ${instanceId}"
+                    env.INSTANCE_ID = instanceId
                 }
             }
         }
-        stage('Create AMI from New Instance') {
+        stage('Create AMI') {
             steps {
                 script {
-                    echo "Creating a new AMI from the new instance..."
                     def timestamp = new Date().format("yyyyMMddHHmmss", TimeZone.getTimeZone('UTC'))
                     def amiName = "${AMI_NAME_PREFIX}-${timestamp}"
-                    def amiId = sh(script: "aws ec2 create-image --instance-id ${NEW_INSTANCE_ID} --name ${amiName} --region ${REGION} --output text --query ImageId", returnStdout: true).trim()
+                    
+                    echo "Creating AMI from the EC2 instance..."
+                    def amiId = sh(script: "aws ec2 create-image --instance-id ${INSTANCE_ID} --name ${amiName} --region ${REGION} --output text --query ImageId", returnStdout: true).trim()
+                    
+                    echo "AMI ID: ${amiId}"
+                    echo "Waiting for AMI to become available..."
                     sh "aws ec2 wait image-available --image-ids ${amiId} --region ${REGION}"
                     
-                    echo "New AMI ID: ${amiId}"
+                    echo "AMI is now available."
                     env.AMI_ID = amiId
                 }
             }
@@ -55,7 +42,7 @@ pipeline {
                     echo "Creating a new Launch Template version with the new AMI..."
                     def createLtVersionCmd = """
                         aws ec2 create-launch-template-version --launch-template-name ${LAUNCH_TEMPLATE_NAME} \
-                        --source-version 1 --launch-template-data ImageId=${env.AMI_ID} --region ${REGION} --query 'LaunchTemplateVersion.VersionNumber' --output text
+                        --source-version 1 --launch-template-data ImageId=${AMI_ID} --region ${REGION} --query 'LaunchTemplateVersion.VersionNumber' --output text
                     """
                     def latestVersion = sh(script: createLtVersionCmd, returnStdout: true).trim()
                     
@@ -80,6 +67,24 @@ pipeline {
                         aws autoscaling start-instance-refresh --auto-scaling-group-name ${ASG_NAME} \
                         --preferences '{"InstanceWarmup": 300, "MinHealthyPercentage": 50}' --region ${REGION}
                     """
+                }
+            }
+        }
+        stage('Terminate Original Instance') {
+            steps {
+                script {
+                    echo "Waiting for the new instance to become healthy..."
+                    def healthyInstances = sh(script: "aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${ASG_NAME} --region ${REGION} --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' --output text", returnStdout: true).trim().split()
+                    
+                    if (healthyInstances.size() > 1) {
+                        echo "Terminating the original instance..."
+                        sh "aws ec2 terminate-instances --instance-ids ${INSTANCE_ID} --region ${REGION}"
+                        
+                        echo "Waiting for the original instance to terminate..."
+                        sh "aws ec2 wait instance-terminated --instance-ids ${INSTANCE_ID} --region ${REGION}"
+                    } else {
+                        echo "Only one instance is running, no need to terminate the original instance."
+                    }
                 }
             }
         }
